@@ -59,7 +59,8 @@ import (
 // commit branch match ErrCommitFailed. A commit branch that became a tag, a
 // replaced table, a diverged base snapshot and files to rewrite that a
 // concurrent commit removed do not, so a retry loop keyed on ErrCommitFailed
-// stops.
+// stops. Nor does ErrDataFilesMissing, returned on any attempt when a
+// delete references data files that are gone.
 var ErrCommitFailed = errors.New("commit failed, refresh and try again")
 
 // ErrCommitRejected means the catalog rejected a commit without writing
@@ -84,7 +85,8 @@ var ErrCommitRejected = errors.New("commit rejected")
 // concurrent commit, a diverged base snapshot, files to rewrite that a
 // concurrent commit removed, a commit branch that became a tag or was
 // deleted, and a replaced table. Only the commit branch's head assertion is
-// rebased.
+// rebased. A commit also ends the transaction when a delete references data
+// files that are missing (ErrDataFilesMissing), on any attempt.
 var ErrTransactionUnusable = errors.New("transaction cannot be committed again")
 
 // ErrWriteIORequired is returned by write paths when the table's file system
@@ -882,11 +884,15 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 			}
 			for _, v := range co.validators {
 				if vErr := v(cc); vErr != nil {
-					// Conflicts with a concurrent commit end the transaction.
-					// Other validator errors, such as read failures, stay
+					// Conflicts with a concurrent commit end the transaction, as
+					// do missing referenced data files, which no retry brings
+					// back. Other validator errors, such as read failures, stay
 					// resumable.
 					if errors.Is(vErr, ErrCommitFailed) {
 						return nil, fmt.Errorf("%w: validation conflict: %w", ErrTransactionUnusable, vErr)
+					}
+					if errors.Is(vErr, ErrDataFilesMissing) {
+						return nil, fmt.Errorf("%w: validation failed: %w", ErrTransactionUnusable, vErr)
 					}
 
 					return nil, vErr
