@@ -210,20 +210,23 @@ func TestRetryableConflictErrors_WrapCommitFailed(t *testing.T) {
 	retryable := []error{
 		ErrConflictingDataFiles,
 		ErrConflictingDeleteFiles,
-		ErrDataFilesMissing,
 	}
 	for _, s := range retryable {
 		assert.ErrorIsf(t, s, ErrCommitFailed, "%v should wrap ErrCommitFailed", s)
 	}
 }
 
-func TestErrCommitDiverged_IsTerminal(t *testing.T) {
-	// Divergence is terminal for the current attempt — retrying the
-	// same updates will produce the same divergence. It therefore
-	// MUST NOT wrap ErrCommitFailed, which is the retry machinery's
+func TestTerminalErrors_DoNotWrapCommitFailed(t *testing.T) {
+	// Retrying the same commit fails identically for these sentinels, so
+	// they MUST NOT wrap ErrCommitFailed, which is the retry machinery's
 	// trigger.
-	assert.False(t, errors.Is(ErrCommitDiverged, ErrCommitFailed),
-		"ErrCommitDiverged must not wrap ErrCommitFailed — it is a terminal error")
+	terminal := []error{
+		ErrCommitDiverged,
+		ErrDataFilesMissing,
+	}
+	for _, s := range terminal {
+		assert.NotErrorIsf(t, s, ErrCommitFailed, "%v must not wrap ErrCommitFailed", s)
+	}
 }
 
 func newConflictTestMetadata(t *testing.T, branchHead *int64) Metadata {
@@ -868,15 +871,31 @@ func TestValidateNoConflictingDataFiles_SnapshotIsolationIsNoOp(t *testing.T) {
 
 type conflictValidationStatIO struct {
 	*trackingCallsIO
+	statCtx context.Context
 }
 
-func (c *conflictValidationStatIO) Stat(name string) (fs.FileInfo, error) {
+func (c *conflictValidationStatIO) Stat(ctx context.Context, name string) (fs.FileInfo, error) {
+	c.statCtx = ctx
 	data, ok := c.files[name]
 	if !ok {
 		return nil, fs.ErrNotExist
 	}
 
 	return conflictManifestFileInfo{name: name, size: int64(len(data))}, nil
+}
+
+func TestConflictManifestIOStatPassesContext(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(t.Context(), key{}, "caller")
+	tio := newTrackingCallsIO()
+	tio.files["manifest.avro"] = []byte("manifest")
+	base := &conflictValidationStatIO{trackingCallsIO: tio}
+	cache := newConflictManifestIO(base)
+
+	_, err := cache.Stat(ctx, "manifest.avro")
+	require.NoError(t, err)
+	require.NotNil(t, base.statCtx)
+	assert.Equal(t, "caller", base.statCtx.Value(key{}))
 }
 
 func TestConflictValidationReusesSharedManifestReads(t *testing.T) {
