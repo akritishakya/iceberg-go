@@ -1002,17 +1002,21 @@ func partitionsMatch(a, b map[int]any) bool {
 }
 
 // buildDVIndex indexes deletion vectors by the data file path they reference.
-// The spec requires at most one DV per data file; a second entry for the same
-// path is rejected with an error.
+// A missing reference must fail planning instead of silently exposing deleted
+// rows. The spec also requires at most one DV per data file.
 func buildDVIndex(dvEntries []iceberg.ManifestEntry) (map[string]iceberg.ManifestEntry, error) {
 	dvIndex := make(map[string]iceberg.ManifestEntry, len(dvEntries))
 	for _, del := range dvEntries {
-		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(del.DataFile()); ref != nil {
-			if _, exists := dvIndex[*ref]; exists {
-				return nil, fmt.Errorf("can't index multiple deletion vectors for %s", *ref)
-			}
-			dvIndex[*ref] = del
+		file := del.DataFile()
+		ref := iceberginternal.BorrowedDataFileReferencedDataFile(file)
+		if ref == nil || *ref == "" {
+			return nil, fmt.Errorf("%w: deletion vector %q is missing referenced_data_file",
+				ErrInvalidMetadata, file.FilePath())
 		}
+		if _, exists := dvIndex[*ref]; exists {
+			return nil, fmt.Errorf("%w: can't index multiple deletion vectors for %s", ErrInvalidMetadata, *ref)
+		}
+		dvIndex[*ref] = del
 	}
 
 	return dvIndex, nil
@@ -2220,12 +2224,53 @@ func (scan *Scan) ReadTasks(ctx context.Context, tasks []FileScanTask) (*arrow.S
 // single data file in tasks: rows that survive that task's own deletes are
 // kept only when they match addedDeletes. Normal scans pass nil.
 func (scan *Scan) readFileTasks(ctx context.Context, tasks []FileScanTask, addedDeletes *FileScanTask) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
+	var added []FileScanTask
+	if addedDeletes != nil {
+		added = []FileScanTask{*addedDeletes}
+	}
+
+	return scan.readFileTasksWithAddedDeletes(ctx, tasks, added, nil)
+}
+
+// readFileTasksWithAddedDeletes reads tasks while retaining rows matched by the
+// corresponding added-delete task for each data file. When positionSinks is
+// set, it records the original file positions and consumes the matched rows
+// internally instead of returning them to the caller.
+func (scan *Scan) readFileTasksWithAddedDeletes(
+	ctx context.Context,
+	tasks []FileScanTask,
+	addedDeletes []FileScanTask,
+	positionSinks map[string]func([]int64),
+) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
 	as, readTasks, releasePlanIO, err := scan.arrowScanForTasks(ctx, tasks)
 	if err != nil {
 		return nil, nil, err
 	}
-	if addedDeletes != nil {
-		as.added = &addedDeleteState{deletes: addedDeletes}
+	if len(addedDeletes) > 0 {
+		byPath := make(map[string]int, len(addedDeletes))
+		for i, task := range addedDeletes {
+			if task.File == nil || task.File.FilePath() == "" {
+				if releasePlanIO != nil {
+					releasePlanIO()
+				}
+
+				return nil, nil, fmt.Errorf("%w: added delete task %d has no data file", ErrInvalidOperation, i)
+			}
+			path := task.File.FilePath()
+			if _, ok := byPath[path]; ok {
+				if releasePlanIO != nil {
+					releasePlanIO()
+				}
+
+				return nil, nil, fmt.Errorf("%w: duplicate added delete task for data file %s", ErrInvalidOperation, path)
+			}
+			byPath[path] = i
+		}
+		as.added = &addedDeleteState{
+			deletes:          addedDeletes,
+			deleteTaskByPath: byPath,
+			positionSinks:    positionSinks,
+		}
 	}
 
 	readRecords := scan.readRecords

@@ -24,6 +24,7 @@ import (
 	"iter"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -52,7 +53,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 		return nil, nil, err
 	}
 
-	if meta.NameMapping() == nil {
+	if _, exists := meta.props[DefaultNameMappingKey]; !exists {
 		nameMapping := meta.CurrentSchema().NameMapping()
 		mappingJson, err := json.Marshal(nameMapping)
 		if err != nil {
@@ -141,7 +142,7 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 		return nil, err
 	}
 
-	if meta.NameMapping() == nil {
+	if _, exists := meta.props[DefaultNameMappingKey]; !exists {
 		nameMapping := meta.CurrentSchema().NameMapping()
 		mappingJson, err := json.Marshal(nameMapping)
 		if err != nil {
@@ -200,8 +201,36 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 			return nil, err
 		}
 		if len(referenced) > 0 {
+			// A first v3 deletion vector is otherwise replayable. If a
+			// concurrent writer adds a DV for the same file, replaying ours
+			// would leave two live vectors and make the table unreadable.
+			dvTargets := make(map[string]struct{}, len(referenced))
+			if meta.formatVersion >= 3 {
+				for _, ref := range referenced {
+					dvTargets[ref] = struct{}{}
+				}
+			}
 			t.addValidator(func(cc *conflictContext) error {
-				return validateDataFilesExist(cc, referenced)
+				if err := validateDataFilesExist(cc, referenced); err != nil {
+					return err
+				}
+				if len(dvTargets) == 0 {
+					return nil
+				}
+
+				return cc.forEachAddedEntry(iceberg.ManifestContentDeletes, func(snap Snapshot, entry iceberg.ManifestEntry) error {
+					file := entry.DataFile()
+					ref := explicitReferencedDataFile(file)
+					if !IsDeletionVector(file) || ref == "" {
+						return nil
+					}
+					if _, ok := dvTargets[ref]; ok {
+						return fmt.Errorf("%w: cannot add a deletion vector for data file %s: concurrent snapshot %d committed a live deletion vector %s for it; reload the table and retry the delete",
+							ErrConflictingDeleteFiles, ref, snap.SnapshotID, file.FilePath())
+					}
+
+					return nil
+				})
 			})
 		}
 	}
@@ -850,7 +879,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	}
 
 	var result []iceberg.DataFile
-	itr := recordsToDataFiles(ctx, t.tbl.Location(), meta, recordWritingArgs{
+	itr := recordsToDataFiles(ctx, meta.loc, meta, recordWritingArgs{
 		sc:          arrowSchema,
 		itr:         releaseIter,
 		fs:          wfs,
@@ -915,7 +944,7 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		existingDVBitmaps[df.FilePath()] = bitmap
 	}
 
-	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, partitionContextByFilePath, recordWritingArgs{
+	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, meta.loc, meta, partitionContextByFilePath, recordWritingArgs{
 		sc:          PositionalDeleteArrowSchema,
 		itr:         posDeleteRecIter,
 		writeUUID:   &commitUUID,
@@ -953,6 +982,11 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		return nil, err
 	}
 
+	if err := tblutils.ValidateParquetReadProperties(meta.props); err != nil {
+		return nil, err
+	}
+	ctx = tblutils.WithTableProperties(ctx, meta.props)
+
 	// Rows that existing position deletes already removed must not be deleted
 	// again, so each task carries its file's position delete files from scan
 	// planning, which matches them by sequence number, partition and path. The
@@ -984,6 +1018,12 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 			Length:      f.FileSizeBytes(),
 		})
 	}
+	if meta.formatVersion == 2 {
+		// Position delete files must be ordered by file path, then row position.
+		slices.SortFunc(tasks, func(a, b FileScanTask) int {
+			return strings.Compare(a.File.FilePath(), b.File.FilePath())
+		})
+	}
 
 	boundFilter, err := iceberg.BindExpr(meta.CurrentSchema(), filter, caseSensitive)
 	if err != nil {
@@ -995,11 +1035,24 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		return nil, fmt.Errorf("failed to build metadata: %w", err)
 	}
 
+	filterIDs, err := iceberg.ExtractFieldIDs(boundFilter)
+	if err != nil {
+		return nil, err
+	}
+	selected := make(map[int]iceberg.Void, len(filterIDs))
+	for _, id := range filterIDs {
+		selected[id] = iceberg.Void{}
+	}
+	projection, err := iceberg.PruneColumns(meta.CurrentSchema(), selected, false)
+	if err != nil {
+		return nil, err
+	}
+
 	scanner := &arrowScan{
 		metadata:        builtMeta,
 		fs:              fs,
 		scanSchema:      meta.CurrentSchema(),
-		projectedSchema: meta.CurrentSchema(),
+		projectedSchema: projection,
 		boundRowFilter:  boundFilter,
 		caseSensitive:   caseSensitive,
 		rowLimit:        -1, // No limit
