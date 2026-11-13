@@ -18,6 +18,7 @@
 package table
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -77,6 +78,7 @@ type RowDelta struct {
 	delFiles    []iceberg.DataFile
 	removedDels []iceberg.DataFile
 	props       iceberg.Properties
+	committed   bool
 }
 
 // NewRowDelta creates a new RowDelta for committing row-level changes
@@ -161,7 +163,17 @@ func (rd *RowDelta) RemoveDeletes(files ...iceberg.DataFile) *RowDelta {
 // optimistic-concurrency conflict fails the transaction's Commit with
 // ErrCommitFailed rather than refreshing and retrying (see
 // RemoveDeletes).
+//
+// Commit is single-shot: any second call returns an error wrapping
+// ErrInvalidOperation, whether or not the first call succeeded, and
+// stages nothing. Reusing the builder would otherwise stage every file
+// it holds a second time and register its conflict validator again.
 func (rd *RowDelta) Commit(ctx context.Context) error {
+	if rd.committed {
+		return fmt.Errorf("%w: RowDelta.Commit already called on this builder", ErrInvalidOperation)
+	}
+	rd.committed = true
+
 	meta, err := rd.txn.txnMeta()
 	if err != nil {
 		return err
@@ -525,7 +537,9 @@ func (rd *RowDelta) findReplacedLiveDVs(ctx context.Context, fs iceio.IO, meta *
 //
 // A removed file that does not resolve to a live delete entry is an
 // error: the producer would otherwise silently skip the removal and
-// the commit would strand two live DVs on one data file. Two removals
+// the commit would strand two live DVs on one data file. When the file
+// is live on the branch head the transaction started from, the error
+// says an operation staged earlier in the transaction removed it. Two removals
 // resolving to live entries that reference the same data file are also
 // an error — the producer keys DV removals by referenced data file, so
 // letting both through would silently drop one, and two live DVs on
@@ -565,6 +579,15 @@ func (rd *RowDelta) resolveRemovedDeletes(ctx context.Context, fs iceio.IO, meta
 		var live iceberg.DataFile
 		switch {
 		case len(candidates) == 0:
+			removed, err := rd.removedEarlierInTransaction(ctx, fs, snap, f.FilePath())
+			if err != nil {
+				return nil, err
+			}
+			if removed {
+				return nil, fmt.Errorf("cannot remove delete file %s: an operation staged earlier in this transaction already removed it",
+					f.FilePath())
+			}
+
 			return nil, fmt.Errorf("cannot remove delete files that do not belong to the table: %s", f.FilePath())
 		case len(candidates) == 1:
 			live = candidates[0]
@@ -617,6 +640,33 @@ func (rd *RowDelta) resolveRemovedDeletes(ctx context.Context, fs iceio.IO, meta
 	}
 
 	return resolved, nil
+}
+
+// removedEarlierInTransaction reports whether path is a live delete entry
+// on the branch head the transaction started from but not on staged, the
+// snapshot this delta plans against: an operation staged earlier in the
+// transaction removed it. resolveRemovedDeletes calls it only for a removal
+// it cannot resolve, so successful commits never pay for the extra scan.
+func (rd *RowDelta) removedEarlierInTransaction(ctx context.Context, fs iceio.IO, staged *Snapshot, path string) (bool, error) {
+	id := rd.txn.baseRefSnapshotID(cmp.Or(rd.txn.branch, MainBranch))
+	if id == nil || *id == staged.SnapshotID {
+		return false, nil
+	}
+	base := rd.txn.tbl.metadata.SnapshotByID(*id)
+	if base == nil {
+		return false, nil
+	}
+
+	for entry, err := range base.entries(ctx, fs, iceberg.ManifestContentDeletes, true) {
+		if err != nil {
+			return false, err
+		}
+		if entry.DataFile().FilePath() == path {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // validate is the client-side conflict check for a RowDelta commit. It

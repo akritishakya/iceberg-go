@@ -496,6 +496,134 @@ func TestRowDeltaMultipleCommitsOnSameTransaction(t *testing.T) {
 	assert.Equal(t, strconv.Itoa(2), snap.Summary.Properties["total-data-files"])
 }
 
+// Why: a reused RowDelta builder re-stages every file it already holds,
+// so a data file staged by the first Commit goes live twice.
+// Condition: Commit is called a second time on the same builder, after a
+// successful first call or after a failed one.
+// Assertion: the second Commit fails with ErrInvalidOperation and stages
+// nothing, so the table holds each file once.
+func TestRowDeltaCommitSingleShot(t *testing.T) {
+	t.Run("data files are not staged twice", func(t *testing.T) {
+		tbl := newRowDeltaCommitTestTable(t)
+		tx := tbl.NewTransaction()
+
+		rd := tx.NewRowDelta(nil).AddRows(buildDataFile(t, "s3://bucket/data/f1.parquet"))
+		require.NoError(t, rd.Commit(t.Context()))
+
+		rd.AddRows(buildDataFile(t, "s3://bucket/data/f2.parquet"))
+		err := rd.Commit(t.Context())
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "already called")
+
+		result, err := tx.Commit(t.Context())
+		require.NoError(t, err)
+
+		snap := result.CurrentSnapshot()
+		require.NotNil(t, snap)
+		assert.Equal(t, "1", snap.Summary.Properties["total-data-files"])
+		assert.Equal(t, "10", snap.Summary.Properties["total-records"])
+	})
+
+	t.Run("deletion vector supersession", func(t *testing.T) {
+		tbl := newRowDeltaCommitTestTableVersion(t, 3)
+		location := tbl.Location()
+
+		arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+		require.NoError(t, err)
+
+		dataPath := location + "/data/data-001.parquet"
+		writeParquetFile(t, dataPath, arrowSc, `[
+			{"id": 1, "data": "alpha"},
+			{"id": 2, "data": "beta"},
+			{"id": 3, "data": "gamma"}
+		]`)
+
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+
+		dv1 := writeDV(t, location, "dv-001.puffin", dataPath, []int64{1})
+		tx2 := tbl.NewTransaction()
+		require.NoError(t, tx2.NewRowDelta(nil).AddDeletes(dv1).Commit(t.Context()))
+		tbl, err = tx2.Commit(t.Context())
+		require.NoError(t, err)
+
+		dv2 := writeDV(t, location, "dv-002.puffin", dataPath, []int64{1, 2})
+		tx3 := tbl.NewTransaction()
+		rd := tx3.NewRowDelta(nil).AddDeletes(dv2).RemoveDeletes(dv1)
+		require.NoError(t, rd.Commit(t.Context()))
+
+		err = rd.Commit(t.Context())
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "already called")
+
+		tbl, err = tx3.Commit(t.Context())
+		require.NoError(t, err)
+		assertRowCount(t, tbl, 1)
+	})
+
+	t.Run("after a failed first call", func(t *testing.T) {
+		tbl := newRowDeltaCommitTestTable(t)
+		rd := tbl.NewTransaction().NewRowDelta(nil)
+
+		err := rd.Commit(t.Context())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "at least one data file or delete file")
+
+		rd.AddRows(buildDataFile(t, "s3://bucket/data/f1.parquet"))
+		err = rd.Commit(t.Context())
+		require.Error(t, err)
+		assert.ErrorIs(t, err, table.ErrInvalidOperation)
+		assert.Contains(t, err.Error(), "already called")
+	})
+}
+
+// Why: a removal another row delta in the same transaction already made
+// was reported as "do not belong to the table", although the DV is in the
+// table the transaction started from.
+// Condition: two row deltas staged on one transaction both remove the
+// same live DV.
+// Assertion: the second Commit names the earlier removal instead.
+func TestRowDeltaRemoveDeletesAlreadyRemovedInTransaction(t *testing.T) {
+	tbl := newRowDeltaCommitTestTableVersion(t, 3)
+	location := tbl.Location()
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	dataPath := location + "/data/data-001.parquet"
+	writeParquetFile(t, dataPath, arrowSc, `[
+		{"id": 1, "data": "alpha"},
+		{"id": 2, "data": "beta"},
+		{"id": 3, "data": "gamma"}
+	]`)
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddDataFilesByPath(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	dv1 := writeDV(t, location, "dv-001.puffin", dataPath, []int64{1})
+	tx2 := tbl.NewTransaction()
+	require.NoError(t, tx2.NewRowDelta(nil).AddDeletes(dv1).Commit(t.Context()))
+	tbl, err = tx2.Commit(t.Context())
+	require.NoError(t, err)
+
+	dv2 := writeDV(t, location, "dv-002.puffin", dataPath, []int64{1, 2})
+	dv3 := writeDV(t, location, "dv-003.puffin", dataPath, []int64{0, 1, 2})
+	tx3 := tbl.NewTransaction()
+
+	require.NoError(t, tx3.NewRowDelta(nil).AddDeletes(dv2).RemoveDeletes(dv1).Commit(t.Context()))
+
+	err = tx3.NewRowDelta(nil).AddDeletes(dv3).RemoveDeletes(dv1).Commit(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already removed it")
+	assert.NotContains(t, err.Error(), "do not belong to the table")
+}
+
 // writeParquetFile writes Arrow records to a Parquet file on local disk.
 func writeParquetFile(t testing.TB, path string, sc *arrow.Schema, jsonData string) {
 	t.Helper()
