@@ -1883,6 +1883,7 @@ func TestRowDeltaRejectsConcurrentFirstDVOnRetry(t *testing.T) {
 	// before reaching the catalog.
 	_, err = txA.Commit(t.Context())
 	require.ErrorIs(t, err, table.ErrTransactionUnusable)
+	assert.Equal(t, int32(1), catA.loadTableCalls.Load())
 	assert.Equal(t, int32(1), catA.commitTableCalls.Load())
 }
 

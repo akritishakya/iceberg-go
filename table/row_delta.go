@@ -733,23 +733,9 @@ func (rd *RowDelta) validateNoConcurrentReplacedDVs(cc *conflictContext) error {
 			addedRefs[ref] = struct{}{}
 		}
 	}
-	if len(addedRefs) == 0 {
-		return nil
-	}
 
-	return cc.forEachAddedEntry(iceberg.ManifestContentDeletes, func(snap Snapshot, entry iceberg.ManifestEntry) error {
-		df := entry.DataFile()
-		ref := explicitReferencedDataFile(df)
-		if !IsDeletionVector(df) || ref == "" {
-			return nil
-		}
-		if _, ok := addedRefs[ref]; ok {
-			return fmt.Errorf("%w: cannot add a deletion vector for data file %s: concurrent snapshot %d committed a live deletion vector %s for it; reload the table and rewrite the DV to supersede the concurrent one, removing the superseded DV in the same row delta",
-				ErrConflictingDeleteFiles, ref, snap.SnapshotID, df.FilePath())
-		}
-
-		return nil
-	})
+	return validateNoConcurrentDVs(cc, addedRefs,
+		"reload the table and rewrite the DV to supersede the concurrent one, removing the superseded DV in the same row delta")
 }
 
 // Operation returns the snapshot operation type that will be used when
