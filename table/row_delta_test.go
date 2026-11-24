@@ -22,6 +22,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1067,6 +1068,43 @@ func TestRowDeltaDVSupersessionSingleSnapshot(t *testing.T) {
 	assert.Equal(t, []uint64{1, 3}, hidden)
 
 	assertRowCount(t, tbl, 3)
+}
+
+// Why: a deletion vector replaces the data file's previous one, so a writer
+// that does not carry the old positions forward resurrects deleted rows.
+// Condition: a data file has a live DV hiding position 0; a second DV hiding
+// position 1 is written with the transaction's previous-deletes loader and
+// committed with the writer's rewritten deletes removed.
+// Assertion: the replacement DV holds positions 0 and 1, and both rows stay
+// hidden.
+func TestRowDeltaDVWriterMergesPreviousDeletionVector(t *testing.T) {
+	tbl, location, dataPath, dv1 := newTableWithLiveDV(t)
+	assertRowCount(t, tbl, 1)
+
+	tx := tbl.NewTransaction()
+	loader, err := tx.PreviousDeletionVectorLoader(t.Context())
+	require.NoError(t, err)
+
+	w := dv.NewDVWriter(iceio.LocalFS{}, func(int32) *iceberg.PartitionSpec {
+		return iceberg.UnpartitionedSpec
+	}, dv.WithPreviousDeletes(loader))
+	require.NoError(t, w.AddPosition(dataPath, 1, 0, nil))
+	dv2, err := w.Flush(t.Context(), location+"/data/dv-002.puffin")
+	require.NoError(t, err)
+	require.Len(t, dv2, 1)
+
+	rewritten := w.RewrittenDeletes()
+	require.Len(t, rewritten, 1)
+	assert.Equal(t, dv1.FilePath(), rewritten[0].FilePath())
+
+	require.NoError(t, tx.NewRowDelta(nil).AddDeletes(dv2...).RemoveDeletes(rewritten...).Commit(t.Context()))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	bm, err := dv.ReadDV(t.Context(), iceio.LocalFS{}, dv2[0])
+	require.NoError(t, err)
+	assert.Equal(t, []uint64{0, 1}, slices.Collect(bm.Positions()))
+	assertRowCount(t, tbl, 0)
 }
 
 // Why: removing a DV without publishing a superseding DV for the same

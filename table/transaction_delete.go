@@ -599,6 +599,33 @@ func (t *Transaction) readLiveDeletionVectors(ctx context.Context, fs io.IO) (li
 	return buildDVIndex(classified.dvEntries)
 }
 
+// PreviousDeletionVectorLoader returns a loader for dv.WithPreviousDeletes that
+// supplies each data file's live deletion vector from this transaction's
+// planning snapshot. Create it on the transaction that commits the RowDelta.
+func (t *Transaction) PreviousDeletionVectorLoader(ctx context.Context) (dv.PreviousDeletesLoader, error) {
+	fs, err := t.tbl.fsF(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dvs, err := t.readLiveDeletionVectors(ctx, fs)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(ctx context.Context, path string) (*dv.RoaringPositionBitmap, []iceberg.DataFile, error) {
+		entry, ok := dvs[path]
+		if !ok {
+			return nil, nil, nil
+		}
+		bitmap, err := dv.ReadDV(ctx, fs, entry.DataFile())
+		if err != nil {
+			return nil, nil, fmt.Errorf("read deletion vector for %s: %w", path, err)
+		}
+
+		return bitmap, []iceberg.DataFile{entry.DataFile()}, nil
+	}, nil
+}
+
 // rewriteFilesWithFilter rewrites data files by preserving only rows that do NOT match the filter.
 // Rows already removed by a delete are dropped too, since those deletes stop applying once the file is replaced.
 // The filter binding and substrait conversion are computed once here and reused across every file.
