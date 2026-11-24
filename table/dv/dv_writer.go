@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
 
 	"github.com/apache/iceberg-go"
@@ -32,6 +33,24 @@ import (
 // SpecResolver looks up a PartitionSpec by its id, mirroring
 // Metadata.PartitionSpecByID. Returns nil if the id is not known.
 type SpecResolver func(specID int32) *iceberg.PartitionSpec
+
+// PreviousDeletesLoader returns the positions already deleted in a data file
+// and the delete files they came from. A nil bitmap means the file has no
+// previous deletes, and files must then be empty. The returned bitmap is
+// read-only; the writer copies it.
+type PreviousDeletesLoader func(ctx context.Context, dataFilePath string) (*RoaringPositionBitmap, []iceberg.DataFile, error)
+
+// DVWriterOption configures a DVWriter.
+type DVWriterOption func(*DVWriter)
+
+// WithPreviousDeletes makes Flush merge each data file's previous deletes,
+// returned by loader, into its new deletion vector. A deletion vector replaces
+// the data file's previous one, so it must carry the old positions forward.
+func WithPreviousDeletes(loader PreviousDeletesLoader) DVWriterOption {
+	return func(w *DVWriter) {
+		w.loadPrevious = loader
+	}
+}
 
 // dvEntry holds the per-data-file state a DV manifest entry needs. specID and
 // partitionData come from the data file's own manifest entry; the spec itself
@@ -47,10 +66,12 @@ type dvEntry struct {
 // a single Puffin file containing one deletion-vector-v1 blob per data file.
 // The returned DataFile entries are ready for RowDelta.AddDeletes().
 type DVWriter struct {
-	fs       iceio.WriteFileIO
-	specByID SpecResolver
-	entries  map[string]*dvEntry
-	order    []string
+	fs           iceio.WriteFileIO
+	specByID     SpecResolver
+	loadPrevious PreviousDeletesLoader
+	rewritten    []iceberg.DataFile
+	entries      map[string]*dvEntry
+	order        []string
 }
 
 // NewDVWriter creates a DVWriter backed by the given writable filesystem.
@@ -58,12 +79,19 @@ type DVWriter struct {
 // caller passes Metadata.PartitionSpecByID directly (wrapped to convert
 // int → int32). The unpartitioned path can pass a resolver that returns
 // iceberg.UnpartitionedSpec for id 0.
-func NewDVWriter(fs iceio.WriteFileIO, specByID SpecResolver) *DVWriter {
-	return &DVWriter{
+// Options such as WithPreviousDeletes are applied in order; with none, the
+// writer writes only the positions it is given.
+func NewDVWriter(fs iceio.WriteFileIO, specByID SpecResolver, opts ...DVWriterOption) *DVWriter {
+	w := &DVWriter{
 		fs:       fs,
 		specByID: specByID,
 		entries:  make(map[string]*dvEntry),
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+
+	return w
 }
 
 func (w *DVWriter) getOrCreateEntry(dataFilePath string, specID int32, partitionData map[int]any) *dvEntry {
@@ -187,9 +215,30 @@ func (w *DVWriter) Load(dataFilePath string, bitmap *RoaringPositionBitmap, spec
 // The location parameter is the full path (including filename) for the
 // Puffin file to create. The caller is responsible for generating a unique
 // path within the table's metadata directory.
+//
+// When a previous-deletes loader is configured, Flush first merges each data
+// file's previous deletes into its new deletion vector. A loader error aborts
+// Flush before any file is written. The merged delete files are available
+// from RewrittenDeletes afterwards.
 func (w *DVWriter) Flush(ctx context.Context, location string) ([]iceberg.DataFile, error) {
+	w.rewritten = nil
 	if len(w.entries) == 0 {
 		return nil, nil
+	}
+
+	var rewritten []iceberg.DataFile
+	if w.loadPrevious != nil {
+		for _, dataFilePath := range w.order {
+			prev, files, err := w.loadPrevious(ctx, dataFilePath)
+			if err != nil {
+				return nil, fmt.Errorf("load previous deletes for %s: %w", dataFilePath, err)
+			}
+			if prev == nil && len(files) > 0 {
+				return nil, fmt.Errorf("load previous deletes for %s: loader returned delete files without positions", dataFilePath)
+			}
+			w.entries[dataFilePath].bitmap.Or(prev)
+			rewritten = append(rewritten, files...)
+		}
 	}
 
 	var buf bytes.Buffer
@@ -282,6 +331,14 @@ func (w *DVWriter) Flush(ctx context.Context, location string) ([]iceberg.DataFi
 
 	w.entries = make(map[string]*dvEntry)
 	w.order = nil
+	w.rewritten = rewritten
 
 	return dataFiles, nil
+}
+
+// RewrittenDeletes returns the delete files whose positions the last Flush
+// merged from the previous-deletes loader. Pass them to RowDelta.RemoveDeletes
+// so the superseded deletion vectors are removed in the same commit.
+func (w *DVWriter) RewrittenDeletes() []iceberg.DataFile {
+	return slices.Clone(w.rewritten)
 }

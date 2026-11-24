@@ -19,7 +19,9 @@ package dv
 
 import (
 	"context"
+	"errors"
 	stdfs "io/fs"
+	"slices"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -552,4 +554,136 @@ func verifyDVReadBack(t *testing.T, fs iceio.IO, df iceberg.DataFile) {
 	bm, err := ReadDV(t.Context(), fs, df)
 	require.NoError(t, err)
 	assert.Equal(t, df.Count(), bm.Cardinality())
+}
+
+// writePreviousDV flushes a plain writer so tests have a real deletion vector
+// to hand back from a previous-deletes loader.
+func writePreviousDV(t *testing.T, fs iceio.WriteFileIO, location, dataPath string, positions []int64) iceberg.DataFile {
+	t.Helper()
+
+	w := NewDVWriter(fs, unpartitionedResolver())
+	require.NoError(t, w.Add(dataPath, positions, 0, nil))
+	files, err := w.Flush(t.Context(), location)
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+
+	return files[0]
+}
+
+// staticLoader returns prev and files for dataPath and nothing for any other path.
+func staticLoader(dataPath string, prev *RoaringPositionBitmap, files []iceberg.DataFile) PreviousDeletesLoader {
+	return func(_ context.Context, path string) (*RoaringPositionBitmap, []iceberg.DataFile, error) {
+		if path != dataPath {
+			return nil, nil, nil
+		}
+
+		return prev, files, nil
+	}
+}
+
+func TestDVWriterMergesPreviousDeletes(t *testing.T) {
+	fs := newTestFS()
+	dataPath := "s3://bucket/data/file-001.parquet"
+	oldDV := writePreviousDV(t, fs, "mem://test/old.puffin", dataPath, []int64{0})
+	prev, err := ReadDV(t.Context(), fs, oldDV)
+	require.NoError(t, err)
+
+	w := NewDVWriter(fs, unpartitionedResolver(),
+		WithPreviousDeletes(staticLoader(dataPath, prev, []iceberg.DataFile{oldDV})))
+	require.NoError(t, w.AddPosition(dataPath, 1, 0, nil))
+
+	dataFiles, err := w.Flush(t.Context(), "mem://test/new.puffin")
+	require.NoError(t, err)
+	require.Len(t, dataFiles, 1)
+	assert.Equal(t, int64(2), dataFiles[0].Count())
+
+	bm, err := ReadDV(t.Context(), fs, dataFiles[0])
+	require.NoError(t, err)
+	assert.Equal(t, []uint64{0, 1}, slices.Collect(bm.Positions()))
+
+	rewritten := w.RewrittenDeletes()
+	require.Len(t, rewritten, 1)
+	assert.Equal(t, oldDV.FilePath(), rewritten[0].FilePath())
+
+	assert.Equal(t, []uint64{0}, slices.Collect(prev.Positions()),
+		"the loader's bitmap must not be modified")
+}
+
+func TestDVWriterPreviousDeletesLoaderReturnsNothing(t *testing.T) {
+	fs := newTestFS()
+	dataPath := "s3://bucket/data/file-001.parquet"
+
+	w := NewDVWriter(fs, unpartitionedResolver(),
+		WithPreviousDeletes(staticLoader(dataPath, nil, nil)))
+	require.NoError(t, w.AddPosition(dataPath, 1, 0, nil))
+
+	dataFiles, err := w.Flush(t.Context(), "mem://test/dv.puffin")
+	require.NoError(t, err)
+	require.Len(t, dataFiles, 1)
+
+	bm, err := ReadDV(t.Context(), fs, dataFiles[0])
+	require.NoError(t, err)
+	assert.Equal(t, []uint64{1}, slices.Collect(bm.Positions()))
+	assert.Empty(t, w.RewrittenDeletes())
+}
+
+func TestDVWriterPreviousDeletesLoaderError(t *testing.T) {
+	fs := newTestFS()
+	loadErr := errors.New("load failed")
+
+	w := NewDVWriter(fs, unpartitionedResolver(), WithPreviousDeletes(
+		func(context.Context, string) (*RoaringPositionBitmap, []iceberg.DataFile, error) {
+			return nil, nil, loadErr
+		}))
+	require.NoError(t, w.AddPosition("s3://bucket/data/file-001.parquet", 1, 0, nil))
+
+	location := "mem://test/dv.puffin"
+	_, err := w.Flush(t.Context(), location)
+	require.ErrorIs(t, err, loadErr)
+
+	_, openErr := fs.Open(t.Context(), location)
+	assert.ErrorIs(t, openErr, stdfs.ErrNotExist,
+		"no file may be written when the loader fails")
+	assert.Empty(t, w.RewrittenDeletes())
+}
+
+func TestDVWriterRewrittenDeletesResetOnNextFlush(t *testing.T) {
+	fs := newTestFS()
+	dataPath := "s3://bucket/data/file-001.parquet"
+	oldDV := writePreviousDV(t, fs, "mem://test/old.puffin", dataPath, []int64{0})
+	prev := NewRoaringPositionBitmap()
+	prev.Set(0)
+
+	w := NewDVWriter(fs, unpartitionedResolver(),
+		WithPreviousDeletes(staticLoader(dataPath, prev, []iceberg.DataFile{oldDV})))
+	require.NoError(t, w.AddPosition(dataPath, 1, 0, nil))
+
+	_, err := w.Flush(t.Context(), "mem://test/new.puffin")
+	require.NoError(t, err)
+	require.Len(t, w.RewrittenDeletes(), 1)
+
+	dataFiles, err := w.Flush(t.Context(), "mem://test/empty.puffin")
+	require.NoError(t, err)
+	assert.Nil(t, dataFiles)
+	assert.Empty(t, w.RewrittenDeletes(),
+		"an empty flush must not report the previous flush's rewritten deletes")
+}
+
+func TestDVWriterPreviousDeletesLoaderFilesWithoutPositions(t *testing.T) {
+	fs := newTestFS()
+	dataPath := "s3://bucket/data/file-001.parquet"
+	oldDV := writePreviousDV(t, fs, "mem://test/old.puffin", dataPath, []int64{0})
+
+	w := NewDVWriter(fs, unpartitionedResolver(),
+		WithPreviousDeletes(staticLoader(dataPath, nil, []iceberg.DataFile{oldDV})))
+	require.NoError(t, w.AddPosition(dataPath, 1, 0, nil))
+
+	location := "mem://test/new.puffin"
+	_, err := w.Flush(t.Context(), location)
+	require.ErrorContains(t, err, "loader returned delete files without positions")
+
+	_, openErr := fs.Open(t.Context(), location)
+	assert.ErrorIs(t, openErr, stdfs.ErrNotExist,
+		"no file may be written when the loader breaks its contract")
+	assert.Empty(t, w.RewrittenDeletes())
 }
